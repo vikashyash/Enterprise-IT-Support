@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class Intent(str, Enum):
-    """The IT support request types the agent understands in Phase 1."""
+    """The IT support request types the agent can recognise."""
 
     KNOWLEDGE = "knowledge"
     TROUBLESHOOTING = "troubleshooting"
@@ -48,6 +48,22 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
 
 
+class ToolAction(BaseModel):
+    """One tool the agent ran during this turn and whether it succeeded."""
+
+    tool: str
+    status: Literal["succeeded", "failed"]
+
+
+class TicketReference(BaseModel):
+    """A ticket the agent created, or found already existing, during this turn."""
+
+    ticket_id: int
+    ticket_number: str
+    status: str
+    created: bool
+
+
 class ChatResponse(BaseModel):
     """Reply returned to the client for one chat turn."""
 
@@ -55,6 +71,6 @@ class ChatResponse(BaseModel):
     message: str
     status: Literal["completed", "waiting_user"]
     intent: Intent | None = None
-    actions: list[dict] = Field(default_factory=list)
-    tickets: list[dict] = Field(default_factory=list)
+    actions: list[ToolAction] = Field(default_factory=list)
+    tickets: list[TicketReference] = Field(default_factory=list)
     sources: list[dict] = Field(default_factory=list)
