@@ -19,13 +19,11 @@ class Settings(BaseSettings):
     llm_timeout_seconds: int = Field(default=30, gt=0)
     gemini_api_key: SecretStr
 
-    database_host: str = "localhost"
-    database_port: int = Field(default=5432, gt=0)
-    database_name: str
-    database_user: str
-    database_password: SecretStr
-    database_pool_size: int = Field(default=5, gt=0)
-    database_statement_timeout_ms: int = Field(default=5000, gt=0)
+    mcp_itsm_url: str = "http://127.0.0.1:8101/mcp"
+    mcp_device_url: str = "http://127.0.0.1:8102/mcp"
+    mcp_infrastructure_url: str = "http://127.0.0.1:8103/mcp"
+    mcp_iam_url: str = "http://127.0.0.1:8104/mcp"
+    mcp_tool_timeout_seconds: float = Field(default=15.0, gt=0)
 
     classification_confidence_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
     max_clarification_attempts: int = Field(default=2, ge=0)

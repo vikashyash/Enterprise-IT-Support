@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Literal
 
@@ -6,19 +7,27 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import tools_condition
 from langgraph.types import interrupt
 
 from app.config import settings
 from app.llm import get_chat_model
+from app.mcp_client import build_llm_tool_specs, call_mcp_tool
 from app.schema import Intent, RequestUnderstanding
 from app.state import SupportState
-from app.tools import check_vpn_status, create_ticket, get_device, get_employee
 
 logger = logging.getLogger(__name__)
 
-SUPPORT_TOOLS = [get_employee, get_device, check_vpn_status, create_ticket]
-TOOL_ENABLED_INTENTS = {Intent.TROUBLESHOOTING.value, Intent.TICKET_REQUEST.value}
+TOOLS_BY_INTENT = {
+    Intent.TROUBLESHOOTING.value: [
+        "get_employee", "get_employee_devices", "get_device", "get_device_status", "get_device_network_info", "get_installed_software", "get_device_storage", "get_device_performance",
+        "check_service_health", "check_vpn_status", "check_network_status", "check_dns_status", "check_sso_status", "check_email_service", "search_active_incidents",
+        "create_ticket", "search_tickets",
+    ],
+    Intent.TICKET_REQUEST.value: [
+        "create_ticket", "get_ticket", "search_tickets", "update_ticket", "add_ticket_comment", "close_ticket", "search_incidents", "get_incident", "get_employee_devices",
+    ],
+}
 
 UNDERSTANDING_SYSTEM_PROMPT = """You are the request-understanding step of an enterprise IT support agent.
 Read the whole conversation and describe the user's latest request as structured data.
@@ -55,14 +64,14 @@ AGENT_SYSTEM_PROMPT = """You are an enterprise IT support agent helping an emplo
 Request type: {intent}
 Request summary: {issue_summary}
 
-You can call tools to look up the employee, their devices and VPN service health, and to create IT tickets.
+Your tools cover the employee's profile, their devices (status, network, storage, performance, installed software), enterprise service health and incidents, and IT tickets.
 How to work:
-- Call only the tools you need, one step at a time, and read each result before deciding the next step.
+- Call only the tools you need and read each result before deciding the next step.
 - The tools already know who the employee is; never ask for or invent employee IDs.
+- For service problems (VPN, email, SSO, DNS), check the service first. If it has an active incident, tell the user and do not troubleshoot their device.
 - If a tool returns ok=false, do not guess the missing data; say what could not be checked.
-- If a service has an active incident, tell the user about it instead of troubleshooting their device.
 - Create a ticket only when the user asks for one or the issue cannot be resolved with the information available.
-- Finish with 2 to 4 short sentences: what you checked, what you found and the next step. Quote ticket numbers exactly as the tool returned them.
+- Finish with 2 to 4 short sentences: what you checked, what you found and the next step. Quote ticket and incident numbers exactly as returned.
 - Never claim an action was performed unless a tool performed it."""
 
 INTENT_NEXT_STEPS = {
@@ -77,6 +86,7 @@ INTENT_NEXT_STEPS = {
 UNKNOWN_REQUEST_MESSAGE = "I can help with IT issues such as VPN, email, device problems, software, access requests, security concerns and tickets. Could you describe what you need in a bit more detail?"
 TOOL_LIMIT_MESSAGE = "I ran the checks I could but couldn't finish the investigation automatically. I recommend raising an IT ticket so a technician can follow up."
 AGENT_FAILURE_MESSAGE = "I couldn't complete the checks right now. Please try again in a few minutes, or ask me to raise an IT ticket."
+SYSTEMS_UNAVAILABLE_MESSAGE = "The IT systems I need to check this are unavailable right now. Please try again shortly, or contact the service desk directly."
 
 
 def select_conversation_messages(messages: list[AnyMessage]) -> list[AnyMessage]:
@@ -130,7 +140,7 @@ def route_after_classification(state: SupportState) -> Literal["ask_user", "run_
     has_attempts_left = state.get("clarification_count", 0) < settings.max_clarification_attempts
     if state.get("missing_information") and has_attempts_left:
         return "ask_user"
-    if state.get("intent") in TOOL_ENABLED_INTENTS:
+    if state.get("intent") in TOOLS_BY_INTENT:
         return "run_support_agent"
     return "generate_response"
 
@@ -144,16 +154,26 @@ def ask_user(state: SupportState) -> dict:
 
 
 async def run_support_agent(state: SupportState) -> dict:
-    """Let the LLM investigate with tools: each pass either asks for more tool calls or writes the final answer for the user."""
+    """Let the LLM investigate with the MCP tools allowed for this intent: each pass either asks for tool calls or writes the final answer."""
     try:
         tool_iterations = state.get("tool_iterations", 0)
         if tool_iterations >= settings.max_tool_iterations:
             logger.warning("Tool iteration limit reached for conversation %s", state.get("conversation_id"))
             return {"final_response": TOOL_LIMIT_MESSAGE, "messages": [AIMessage(content=TOOL_LIMIT_MESSAGE)]}
 
+        tool_specs = build_llm_tool_specs(TOOLS_BY_INTENT[state["intent"]])
+        if not tool_specs:
+            logger.error("No MCP tools available for intent %s", state["intent"])
+            return {"final_response": SYSTEMS_UNAVAILABLE_MESSAGE, "messages": [AIMessage(content=SYSTEMS_UNAVAILABLE_MESSAGE)]}
+
+        print()
+        print()
+        print(tool_specs,"tool specs listing....")
+        print()
+        print()
+
         system_prompt = AGENT_SYSTEM_PROMPT.format(intent=state["intent"], issue_summary=state.get("issue_summary") or state["request"])
-        agent_model = get_chat_model().bind_tools(SUPPORT_TOOLS)
-        reply = await agent_model.ainvoke([SystemMessage(content=system_prompt), *state["messages"]])
+        reply = await get_chat_model().bind_tools(tool_specs).ainvoke([SystemMessage(content=system_prompt), *state["messages"]])
         logger.debug("Agent reply for conversation %s: tool_calls=%s", state.get("conversation_id"), [tool_call["name"] for tool_call in reply.tool_calls])
 
         if reply.tool_calls:
@@ -165,6 +185,15 @@ async def run_support_agent(state: SupportState) -> dict:
     except Exception as error:
         logger.exception("Support agent failed for conversation %s", state.get("conversation_id"))
         return {"final_response": AGENT_FAILURE_MESSAGE, "messages": [AIMessage(content=AGENT_FAILURE_MESSAGE)], "errors": [{"node": "run_support_agent", "error": str(error)}]}
+
+
+async def execute_tools(state: SupportState) -> dict:
+    """Run every tool call from the agent's last reply on the MCP servers in parallel, with the user's identity supplied by the backend."""
+    trusted_arguments = {"employee_code": state["user_id"], "conversation_id": state["conversation_id"]}
+    allowed_tool_names = TOOLS_BY_INTENT.get(state["intent"], [])
+    tool_calls = state["messages"][-1].tool_calls
+    tool_messages = await asyncio.gather(*(call_mcp_tool(tool_call, trusted_arguments, allowed_tool_names) for tool_call in tool_calls))
+    return {"messages": list(tool_messages)}
 
 
 async def generate_response(state: SupportState) -> dict:
@@ -191,13 +220,13 @@ def handle_unknown_request(state: SupportState) -> dict:
 
 
 def build_graph(check_pointer: BaseCheckpointSaver | None = None) -> CompiledStateGraph:
-    """Assemble the Phase 2 support workflow (understanding, clarification, tool-calling agent loop) and compile it with a checkpointer."""
+    """Assemble the Phase 3 support workflow (understanding, clarification, MCP-backed agent loop) and compile it with a checkpointer."""
     workflow = StateGraph(SupportState)
     workflow.add_node("understand_request", understand_request)
     workflow.add_node("classify_request", classify_request)
     workflow.add_node("ask_user", ask_user)
     workflow.add_node("run_support_agent", run_support_agent)
-    workflow.add_node("execute_tools", ToolNode(SUPPORT_TOOLS, handle_tool_errors=True))
+    workflow.add_node("execute_tools", execute_tools)
     workflow.add_node("generate_response", generate_response)
     workflow.add_node("handle_unknown_request", handle_unknown_request)
 

@@ -9,8 +9,8 @@ from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.types import Command
 
 from app.config import settings
-from app.database import engine
 from app.graph import UNKNOWN_REQUEST_MESSAGE, build_graph
+from app.mcp_client import MCP_SERVERS, available_tools, connected_servers, load_mcp_tools
 from app.schema import ChatRequest, ChatResponse, TicketReference, ToolAction
 
 logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -21,11 +21,9 @@ support_graph = build_graph()
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    """Close pooled database connections cleanly when the API shuts down."""
-    try:
-        yield
-    finally:
-        await engine.dispose()
+    """Discover the MCP tools before the API starts taking requests."""
+    await load_mcp_tools()
+    yield
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
@@ -41,9 +39,17 @@ async def find_pending_question(thread_config: dict) -> str | None:
 
 
 @app.get("/health")
-async def health_check() -> dict[str, str]:
-    """Report that the API process is up."""
-    return {"status": "ok", "environment": settings.app_env}
+async def health_check() -> dict:
+    """Report whether the API is up and which MCP servers and tools it can currently use."""
+    status = "ok" if len(connected_servers) == len(MCP_SERVERS) else "degraded"
+    return {"status": status, "environment": settings.app_env, "mcp_servers": connected_servers, "mcp_tools": len(available_tools)}
+
+
+@app.post("/mcp/reload")
+async def reload_mcp_tools() -> dict:
+    """Rediscover MCP tools, for example after starting a server that was down when the API booted."""
+    await load_mcp_tools()
+    return {"mcp_servers": connected_servers, "mcp_tools": len(available_tools)}
 
 
 @app.post("/chat", response_model=ChatResponse)
