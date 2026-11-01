@@ -13,6 +13,7 @@ from langgraph.types import interrupt
 from app.config import settings
 from app.llm import get_chat_model
 from app.mcp_client import build_llm_tool_specs, call_mcp_tool
+from app.rag import search_knowledge
 from app.schema import Intent, RequestUnderstanding
 from app.state import SupportState
 
@@ -60,6 +61,16 @@ If details are still missing, say which ones are needed to continue.
 Do not claim you have already checked any system or performed any action.
 Do not invent company policies, ticket numbers or system status."""
 
+KNOWLEDGE_SYSTEM_PROMPT = """You are an enterprise IT support assistant answering from internal documentation only.
+Question: {question}
+
+Use only the excerpts below. If they do not contain the answer, say it is not in the IT knowledge base and offer to raise a ticket.
+Do not invent policy, URLs, gateway names, versions or approval rules.
+Write 3 to 6 short sentences. Do not add a sources list; the API attaches sources separately.
+
+Excerpts:
+{excerpts}"""
+
 AGENT_SYSTEM_PROMPT = """You are an enterprise IT support agent helping an employee.
 Request type: {intent}
 Request summary: {issue_summary}
@@ -87,6 +98,7 @@ UNKNOWN_REQUEST_MESSAGE = "I can help with IT issues such as VPN, email, device 
 TOOL_LIMIT_MESSAGE = "I ran the checks I could but couldn't finish the investigation automatically. I recommend raising an IT ticket so a technician can follow up."
 AGENT_FAILURE_MESSAGE = "I couldn't complete the checks right now. Please try again in a few minutes, or ask me to raise an IT ticket."
 SYSTEMS_UNAVAILABLE_MESSAGE = "The IT systems I need to check this are unavailable right now. Please try again shortly, or contact the service desk directly."
+NO_KNOWLEDGE_MESSAGE = "I could not find this in the internal IT knowledge base. If you want, I can raise a ticket so the service desk can follow up."
 
 
 def select_conversation_messages(messages: list[AnyMessage]) -> list[AnyMessage]:
@@ -133,13 +145,15 @@ def classify_request(state: SupportState) -> dict:
     return {}
 
 
-def route_after_classification(state: SupportState) -> Literal["ask_user", "run_support_agent", "generate_response", "handle_unknown_request"]:
-    """Pick the next node: unknown gets a fallback, missing details get a question, tool-backed intents go to the agent, the rest get a reply."""
+def route_after_classification(state: SupportState) -> Literal["ask_user", "run_support_agent", "retrieve_knowledge", "generate_response", "handle_unknown_request"]:
+    """Pick the next node: unknown gets a fallback, missing details get a question, knowledge goes to RAG, tool-backed intents go to the agent, the rest get a reply."""
     if state.get("intent") == Intent.UNKNOWN.value:
         return "handle_unknown_request"
     has_attempts_left = state.get("clarification_count", 0) < settings.max_clarification_attempts
     if state.get("missing_information") and has_attempts_left:
         return "ask_user"
+    if state.get("intent") == Intent.KNOWLEDGE.value:
+        return "retrieve_knowledge"
     if state.get("intent") in TOOLS_BY_INTENT:
         return "run_support_agent"
     return "generate_response"
@@ -166,12 +180,6 @@ async def run_support_agent(state: SupportState) -> dict:
             logger.error("No MCP tools available for intent %s", state["intent"])
             return {"final_response": SYSTEMS_UNAVAILABLE_MESSAGE, "messages": [AIMessage(content=SYSTEMS_UNAVAILABLE_MESSAGE)]}
 
-        print()
-        print()
-        print(tool_specs,"tool specs listing....")
-        print()
-        print()
-
         system_prompt = AGENT_SYSTEM_PROMPT.format(intent=state["intent"], issue_summary=state.get("issue_summary") or state["request"])
         reply = await get_chat_model().bind_tools(tool_specs).ainvoke([SystemMessage(content=system_prompt), *state["messages"]])
         logger.debug("Agent reply for conversation %s: tool_calls=%s", state.get("conversation_id"), [tool_call["name"] for tool_call in reply.tool_calls])
@@ -194,6 +202,30 @@ async def execute_tools(state: SupportState) -> dict:
     tool_calls = state["messages"][-1].tool_calls
     tool_messages = await asyncio.gather(*(call_mcp_tool(tool_call, trusted_arguments, allowed_tool_names) for tool_call in tool_calls))
     return {"messages": list(tool_messages)}
+
+
+async def retrieve_knowledge(state: SupportState) -> dict:
+    """Search the internal knowledge base for chunks the signed-in employee is allowed to read."""
+    documents = await search_knowledge(state.get("request") or state.get("issue_summary") or "", state["user_id"])
+    return {"retrieved_documents": documents}
+
+
+async def respond_knowledge(state: SupportState) -> dict:
+    """Answer a knowledge question from retrieved chunks only; if nothing relevant was found, say so."""
+    documents = state.get("retrieved_documents") or []
+    if not documents:
+        return {"final_response": NO_KNOWLEDGE_MESSAGE, "messages": [AIMessage(content=NO_KNOWLEDGE_MESSAGE)]}
+    try:
+        excerpts = "\n\n".join(f"[{document['title']}]\n{document['content']}" for document in documents)
+        system_prompt = KNOWLEDGE_SYSTEM_PROMPT.format(question=state.get("request") or "", excerpts=excerpts)
+        reply = await get_chat_model().ainvoke([SystemMessage(content=system_prompt), *select_conversation_messages(state["messages"])])
+        reply_text = read_message_text(reply)
+        if not reply_text:
+            raise ValueError("LLM returned an empty knowledge response")
+        return {"final_response": reply_text, "messages": [AIMessage(content=reply_text)]}
+    except Exception as error:
+        logger.exception("Knowledge response failed for conversation %s", state.get("conversation_id"))
+        return {"final_response": NO_KNOWLEDGE_MESSAGE, "messages": [AIMessage(content=NO_KNOWLEDGE_MESSAGE)], "errors": [{"node": "respond_knowledge", "error": str(error)}]}
 
 
 async def generate_response(state: SupportState) -> dict:
@@ -220,22 +252,26 @@ def handle_unknown_request(state: SupportState) -> dict:
 
 
 def build_graph(check_pointer: BaseCheckpointSaver | None = None) -> CompiledStateGraph:
-    """Assemble the Phase 3 support workflow (understanding, clarification, MCP-backed agent loop) and compile it with a checkpointer."""
+    """Assemble the Phase 4 support workflow (understanding, clarification, MCP tools, RAG knowledge) and compile it with a checkpointer."""
     workflow = StateGraph(SupportState)
     workflow.add_node("understand_request", understand_request)
     workflow.add_node("classify_request", classify_request)
     workflow.add_node("ask_user", ask_user)
     workflow.add_node("run_support_agent", run_support_agent)
     workflow.add_node("execute_tools", execute_tools)
+    workflow.add_node("retrieve_knowledge", retrieve_knowledge)
+    workflow.add_node("respond_knowledge", respond_knowledge)
     workflow.add_node("generate_response", generate_response)
     workflow.add_node("handle_unknown_request", handle_unknown_request)
 
     workflow.add_edge(START, "understand_request")
     workflow.add_edge("understand_request", "classify_request")
-    workflow.add_conditional_edges("classify_request", route_after_classification, ["ask_user", "run_support_agent", "generate_response", "handle_unknown_request"])
+    workflow.add_conditional_edges("classify_request", route_after_classification, ["ask_user", "run_support_agent", "retrieve_knowledge", "generate_response", "handle_unknown_request"])
     workflow.add_edge("ask_user", "understand_request")
     workflow.add_conditional_edges("run_support_agent", tools_condition, {"tools": "execute_tools", END: END})
     workflow.add_edge("execute_tools", "run_support_agent")
+    workflow.add_edge("retrieve_knowledge", "respond_knowledge")
+    workflow.add_edge("respond_knowledge", END)
     workflow.add_edge("generate_response", END)
     workflow.add_edge("handle_unknown_request", END)
 

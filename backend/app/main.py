@@ -72,6 +72,7 @@ async def chat(chat_request: ChatRequest) -> ChatResponse:
                 "clarifying_question": None,
                 "clarification_count": 0,
                 "tool_iterations": 0,
+                "retrieved_documents": [],
                 "final_response": None,
             }
 
@@ -97,8 +98,17 @@ async def chat(chat_request: ChatRequest) -> ChatResponse:
             if message.name == "create_ticket" and succeeded:
                 tickets.insert(0, TicketReference(**tool_output["ticket"], created=tool_output["created"]))
 
-        logger.info("Conversation %s completed with intent=%s tools=%s tickets=%s", conversation_id, result.get("intent"), [action.tool for action in actions], [ticket.ticket_number for ticket in tickets])
-        return ChatResponse(conversation_id=conversation_id, message=result.get("final_response") or UNKNOWN_REQUEST_MESSAGE, status="completed", intent=result.get("intent"), actions=actions, tickets=tickets)
+        sources: list[dict] = []
+        seen_document_ids: set[str] = set()
+        for document in result.get("retrieved_documents") or []:
+            document_id = document.get("document_id")
+            if not document_id or document_id in seen_document_ids:
+                continue
+            seen_document_ids.add(document_id)
+            sources.append({"document_id": document_id, "title": document.get("title"), "category": document.get("category")})
+
+        logger.info("Conversation %s completed with intent=%s tools=%s tickets=%s sources=%s", conversation_id, result.get("intent"), [action.tool for action in actions], [ticket.ticket_number for ticket in tickets], [source["document_id"] for source in sources])
+        return ChatResponse(conversation_id=conversation_id, message=result.get("final_response") or UNKNOWN_REQUEST_MESSAGE, status="completed", intent=result.get("intent"), actions=actions, tickets=tickets, sources=sources)
     except Exception:
         logger.exception("Chat turn failed for conversation %s", chat_request.conversation_id)
         raise HTTPException(status_code=500, detail="The support agent could not process this request. Please try again.")

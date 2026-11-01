@@ -27,6 +27,7 @@ class SupportState(TypedDict, total=False):
     clarification_count: int
 
     tool_iterations: int
+    retrieved_documents: list[dict]
 
     final_response: str | None
     errors: Annotated[list[dict], operator.add]
